@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+#
+# The process behind claude-rc.service (systemd --user). Runs one `claude rc` in $HOME
+# and cleanses this machine's Remote Control registrations around it:
+#
+#   systemctl --user start claude-rc     cleanse, then start a fresh server
+#   systemctl --user stop claude-rc      SIGTERM: stop the server, then cleanse
+#   systemctl --user restart claude-rc   both, so the app sees one fresh entry
+#   journalctl --user -u claude-rc       the server's output and this script's log
+#
+#   claude-rc-service cleanse --dry-run  show what a cleanse would delete
+#
+# The cleanse: `claude rc` keeps its environment registered after it exits, so the app
+# keeps listing it, and no CLI option removes it. The cleanse deletes only environments
+# that `claude rc` registered on this machine, through the undocumented
+# DELETE /v1/environments/bridge/{id}. It identifies them by machine_id plus a
+# bridge-pointer.json with "source":"standalone", then removes those pointers.
+# Interactive sessions with /rc on (pointer "source":"repl"), other machines on the
+# same account, and cloud environments are left alone.
+#
+# The unit uses KillMode=mixed, so SIGTERM reaches only this script and the trap can
+# stop `claude rc` itself, in order, before cleansing.
+#
+# Bypass also needs permissions.disableAutoMode set to "disable" in
+# ~/.claude/settings.json, or the mobile app switches new sessions to Auto. install.sh
+# sets it. Part of pharos: https://github.com/shitchell/pharos (see its README).
+#
+# Optional per-machine settings, ~/.config/claude-rc-service.conf (sourced as bash):
+#   CLAUDE_RC_EXTRA_ARGS=(--no-create-session-in-dir)
+
+set -u
+
+export PATH="${HOME}/bin:${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+for node_bin in "${HOME}"/.nvm/versions/node/*/bin; do
+    [[ -d "${node_bin}" ]] && PATH="${node_bin}:${PATH}"
+done
+
+API="https://api.anthropic.com"
+CLAUDE_RC_EXTRA_ARGS=()
+# shellcheck disable=SC1091
+[[ -f "${HOME}/.config/claude-rc-service.conf" ]] && . "${HOME}/.config/claude-rc-service.conf"
+
+CHILD=""
+
+function log() {
+    echo "claude-rc-service: ${*}"
+}
+
+function api() {
+    # usage: api METHOD PATH OUTFILE; prints the HTTP status. The token goes through
+    # stdin so it never appears in a process list.
+    local version
+    version=$(claude --version 2>/dev/null | cut -d' ' -f1)
+    jq -r '"header = \"Authorization: Bearer \(.claudeAiOauth.accessToken)\""' \
+        "${HOME}/.claude/.credentials.json" \
+        | curl -sS -K - -X "${1}" -m 20 -o "${3}" -w '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            -H 'anthropic-version: 2023-06-01' \
+            -H 'anthropic-beta: environments-2025-11-01' \
+            -H "x-environment-runner-version: ${version}" \
+            -H "User-Agent: claude-code/${version}" \
+            "${API}${2}"
+}
+
+function pointers() {
+    # usage: pointers SOURCE; prints "<environmentId> <pointer path>" for each pointer
+    # with that source. `claude rc` writes "standalone"; an interactive session with
+    # Remote Control on writes "repl".
+    local file
+    while IFS= read -r -d '' file; do
+        jq -r --arg s "${1}" --arg f "${file}" \
+            'select(.source == $s and .environmentId) | "\(.environmentId) \($f)"' "${file}" 2>/dev/null
+    done < <(find "${HOME}/.claude/projects" -maxdepth 2 -name bridge-pointer.json -print0 2>/dev/null)
+}
+
+function cleanse() {
+    # Deletes only environments that this machine registered for `claude rc`: a bridge
+    # environment whose machine_id is ours AND whose ID a "standalone" pointer holds.
+    # Interactive /rc sessions ("repl" pointers) are left alone, and so are this
+    # machine's environments that no pointer claims.
+    local dry_run="${1:-false}" out code id name kind machine failed=0 listing
+    local mine standalone repl verb
+    mine=$(jq -r '.remoteControlMachineId // empty' "${HOME}/.claude.json" 2>/dev/null)
+    if [[ -z "${mine}" ]]; then
+        log 'cleanse: no remoteControlMachineId in ~/.claude.json; nothing deleted'
+        return 1
+    fi
+    standalone=$(pointers standalone)
+    repl=$(pointers repl)
+
+    out=$(mktemp)
+    code=$(api GET '/v1/environments?limit=100' "${out}")
+    if [[ "${code}" != 200 ]]; then
+        log "cleanse: listing environments returned HTTP ${code}; nothing deleted"
+        rm -f "${out}"
+        return 1
+    fi
+    listing=$(jq -r '(.data // .environments // [])[]
+        | "\(.environment_id // .id) \(.config.type // "-") \(.metadata.machine_id // "-") \(.name)"' "${out}")
+    rm -f "${out}"
+
+    while read -r id kind machine name; do
+        [[ -n "${id}" ]] || continue
+        if [[ "${kind}" != bridge || "${machine}" != "${mine}" ]]; then
+            [[ "${dry_run}" == true ]] && log "keep (not this machine's Remote Control): ${name}"
+            continue
+        fi
+        if [[ $'\n'"${repl}" == *$'\n'"${id} "* ]]; then
+            [[ "${dry_run}" == true ]] && log "keep (interactive /rc session): ${name} (${id})"
+            continue
+        fi
+        if [[ $'\n'"${standalone}" != *$'\n'"${id} "* ]]; then
+            log "keep (no pointer claims it; delete by hand if stale): ${name} (${id})"
+            continue
+        fi
+        if [[ "${dry_run}" == true ]]; then
+            log "would delete (claude rc): ${name} (${id})"
+            continue
+        fi
+        out=$(mktemp)
+        code=$(api DELETE "/v1/environments/bridge/${id}" "${out}")
+        log "cleanse: deleted ${name} (${id}): HTTP ${code}"
+        [[ "${code}" == 200 ]] || failed=1
+        rm -f "${out}"
+    done <<<"${listing}"
+
+    verb=$([[ "${dry_run}" == true ]] && echo 'would remove' || echo 'removed')
+    while read -r id file; do
+        [[ -n "${file}" ]] || continue
+        [[ "${dry_run}" == true ]] || rm -f "${file}"
+        log "cleanse: ${verb} claude rc pointer ${file#"${HOME}"/.claude/projects/}"
+    done <<<"${standalone}"
+    return "${failed}"
+}
+
+function trust-home() {
+    local file="${HOME}/.claude.json" tmp
+    [[ -f "${file}" ]] || return 0
+    [[ "$(jq -r '.projects[env.HOME].hasTrustDialogAccepted // false' "${file}")" == true ]] && return 0
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    if jq '.projects[env.HOME].hasTrustDialogAccepted = true' "${file}" >"${tmp}"; then
+        chmod --reference="${file}" "${tmp}"
+        mv "${tmp}" "${file}"
+    else
+        rm -f "${tmp}"
+    fi
+}
+
+function on-term() {
+    trap '' TERM INT HUP
+    log "stop requested; stopping claude rc (pid ${CHILD})"
+    if [[ -n "${CHILD}" ]] && kill -0 "${CHILD}" 2>/dev/null; then
+        kill -INT "${CHILD}" 2>/dev/null
+        for _ in {1..40}; do
+            kill -0 "${CHILD}" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "${CHILD}" 2>/dev/null; then
+            log 'claude rc ignored SIGINT for 40s; sending SIGTERM'
+            kill -TERM "${CHILD}" 2>/dev/null
+            sleep 5
+        fi
+    fi
+    cleanse || log 'cleanse did not fully succeed'
+    log 'stopped'
+    exit 0
+}
+
+function run() {
+    local bin status
+    bin=$(type -P claude) || { log 'claude not found'; exit 1; }
+    cleanse || log 'cleanse did not fully succeed; starting anyway'
+    trust-home
+    trap on-term TERM INT HUP
+    # A background job in a non-interactive shell starts with SIGINT ignored, and
+    # on-term stops claude with SIGINT. `trap - INT` in the subshell undoes that.
+    (
+        trap - INT
+        exec env -u ANTHROPIC_API_KEY "${bin}" rc --spawn same-dir \
+            --permission-mode bypassPermissions "${CLAUDE_RC_EXTRA_ARGS[@]}" </dev/null
+    ) &
+    CHILD=$!
+    log "started claude rc (pid ${CHILD})"
+    wait "${CHILD}"
+    status=$?
+    log "claude rc exited with status ${status}"
+    exit "${status}"
+}
+
+case "${1:-}" in
+    run)
+        run
+        ;;
+    cleanse)
+        if [[ "${2:-}" == --dry-run ]]; then
+            cleanse true
+        else
+            echo 'refusing to cleanse while the service may be running; use:' >&2
+            echo '  systemctl --user restart claude-rc' >&2
+            exit 2
+        fi
+        ;;
+    *)
+        echo "usage: ${0##*/} run | cleanse --dry-run" >&2
+        echo "manage it with: systemctl --user {start|stop|restart|status} claude-rc" >&2
+        exit 2
+        ;;
+esac
