@@ -22,7 +22,7 @@ Requires Linux with a systemd user manager, `bash`, `jq`, `curl`, `flock`, and C
 Code logged in with a claude.ai subscription (not an API key).
 
 ```bash
-git clone git@github.com:shitchell/pharos.git
+git clone https://github.com/shitchell/pharos.git
 cd pharos
 ./install.sh
 ```
